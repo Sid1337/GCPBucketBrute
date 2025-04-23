@@ -5,24 +5,23 @@ import multiprocessing
 import json
 import sys
 import textwrap
+import threading
 
 from functools import partial
 from datetime import datetime, timedelta
 
 import requests
 import google.oauth2.credentials
+from tqdm import tqdm
 
 from google.cloud import storage
 from google.oauth2 import service_account
 
 
-# Write to file and print to screen
 def outprint(data='', file_path='', normal_print=''):
     with open(file_path, 'a+') as f:
         f.write('{}\n'.format(data))
-
     normal_print(data)
-
 
 def generate_bucket_permutations(keyword):
     permutation_templates = [
@@ -48,10 +47,7 @@ def generate_bucket_permutations(keyword):
     buckets.append('{}.org'.format(keyword))
     buckets = list(set(buckets))
 
-    # Strip any guesses less than 3 characters or more than 63 characters
-    for bucket in buckets:
-        if len(bucket) < 3 or len(bucket) > 63:
-            del buckets[bucket]
+    buckets = [b for b in buckets if 3 <= len(b) <= 63]
 
     print('\nGenerated {} bucket permutations.\n'.format(len(buckets)))
     return buckets
@@ -94,7 +90,6 @@ def main(args):
                 print('\nNo authentication method selected. Only performing unauthenticated enumeration.')
                 client = None
 
-    subprocesses = []
     if args.keyword:
         buckets = generate_bucket_permutations(args.keyword)
     elif args.wordlist:
@@ -106,22 +101,41 @@ def main(args):
             buckets = fd.read().splitlines()
 
     start_time = time.time()
+    counter = multiprocessing.Value('i', 0)
 
+    def show_progress():
+        with tqdm(total=len(buckets), desc='Scanning Buckets') as pbar:
+            last = 0
+            while True:
+                with counter.get_lock():
+                    current = counter.value
+                pbar.update(current - last)
+                last = current
+                if current >= len(buckets):
+                    break
+                time.sleep(0.1)
+
+    progress_thread = threading.Thread(target=show_progress)
+    progress_thread.start()
+
+    subprocesses = []
     for i in range(0, args.subprocesses):
         start = int(len(buckets) / args.subprocesses * i)
         end = int(len(buckets) / args.subprocesses * (i+1))
         permutation_list = buckets[start:end]
-        subproc = Worker(client, print, permutation_list, args.out_file)
+        subproc = Worker(client, print, permutation_list, args.out_file, counter)
         subprocesses.append(subproc)
         subproc.start()
 
     cancelled = False
-    while len(subprocesses) > 0:
-        try:
-            subprocesses = [s.join() for s in subprocesses if s is not None]
-        except KeyboardInterrupt:
-            cancelled = True
-            print('Ctrl+C pressed, killing subprocesses...')
+    try:
+        for s in subprocesses:
+            s.join()
+    except KeyboardInterrupt:
+        cancelled = True
+        print('Ctrl+C pressed, killing subprocesses...')
+
+    progress_thread.join()
 
     if not cancelled:
         end_time = time.time()
@@ -141,35 +155,33 @@ def main(args):
     if args.out_file:
         print = normal_print
 
-
 class Worker(multiprocessing.Process):
-    def __init__(self, client, print, permutation_list, out_file):
-        multiprocessing.Process.__init__(self)
+    def __init__(self, client, print, permutation_list, out_file, counter):
+        super().__init__()
         self.client = client
         self.print = print
         self.permutation_list = permutation_list
         self.out_file = out_file
+        self.counter = counter
 
     def run(self):
         try:
             for bucket_name in self.permutation_list:
                 if self.check_existence(bucket_name):
                     self.check_permissions(bucket_name)
+                with self.counter.get_lock():
+                    self.counter.value += 1
         except KeyboardInterrupt:
             return
 
     def check_existence(self, bucket_name):
-        # Check if bucket exists before trying to TestIamPermissions on it
         response = requests.head('https://www.googleapis.com/storage/v1/b/{}'.format(bucket_name))
-        if response.status_code not in [400, 404]:
-            return True
-        return False
+        return response.status_code not in [400, 404]
 
     def check_permissions(self, bucket_name):
         authenticated_permissions = []
         unauthenticated_permissions = []
 
-        # If client exists, use it to make an authenticated check
         if self.client:
             authenticated_permissions = self.client.bucket(bucket_name).test_iam_permissions(
                 permissions=[
@@ -185,7 +197,6 @@ class Worker(multiprocessing.Process):
                     'storage.objects.update'
                 ]
             )
-
             if authenticated_permissions:
                 self.print('\n    AUTHENTICATED ACCESS ALLOWED: {}'.format(bucket_name))
                 if 'storage.buckets.setIamPolicy' in authenticated_permissions:
@@ -194,14 +205,14 @@ class Worker(multiprocessing.Process):
                     self.print('        - AUTHENTICATED LISTABLE (storage.objects.list)')
                 if 'storage.objects.get' in authenticated_permissions:
                     self.print('        - AUTHENTICATED READABLE (storage.objects.get)')
-                if 'storage.objects.create' in authenticated_permissions or 'storage.objects.delete' in authenticated_permissions or 'storage.objects.update' in authenticated_permissions:
+                if any(p in authenticated_permissions for p in ['storage.objects.create', 'storage.objects.delete', 'storage.objects.update']):
                     self.print('        - AUTHENTICATED WRITABLE (storage.objects.create, storage.objects.delete, and/or storage.objects.update)')
                 self.print('        - ALL PERMISSIONS:')
                 self.print(textwrap.indent('{}\n'.format(json.dumps(authenticated_permissions, indent=4)), '        '))
 
-        # If authenticated, both auth and unauth will be made because results could be different
-        # If not authenticated, then just unauth will go
-        unauthenticated_permissions = requests.get('https://www.googleapis.com/storage/v1/b/{}/iam/testPermissions?permissions=storage.buckets.delete&permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.buckets.setIamPolicy&permissions=storage.buckets.update&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list&permissions=storage.objects.update'.format(bucket_name)).json()
+        unauthenticated_permissions = requests.get(
+            'https://www.googleapis.com/storage/v1/b/{}/iam/testPermissions?permissions=storage.buckets.delete&permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.buckets.setIamPolicy&permissions=storage.buckets.update&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list&permissions=storage.objects.update'.format(bucket_name)
+        ).json()
 
         if unauthenticated_permissions.get('permissions'):
             self.print('\n    UNAUTHENTICATED ACCESS ALLOWED: {}'.format(bucket_name))
@@ -211,7 +222,7 @@ class Worker(multiprocessing.Process):
                 self.print('        - UNAUTHENTICATED LISTABLE (storage.objects.list)')
             if 'storage.objects.get' in unauthenticated_permissions['permissions']:
                 self.print('        - UNAUTHENTICATED READABLE (storage.objects.get)')
-            if 'storage.objects.create' in unauthenticated_permissions['permissions'] or 'storage.objects.delete' in unauthenticated_permissions['permissions'] or 'storage.objects.update' in unauthenticated_permissions['permissions']:
+            if any(p in unauthenticated_permissions['permissions'] for p in ['storage.objects.create', 'storage.objects.delete', 'storage.objects.update']):
                 self.print('        - UNAUTHENTICATED WRITABLE (storage.objects.create, storage.objects.delete, and/or storage.objects.update)')
             self.print('        - ALL PERMISSIONS:')
             self.print(textwrap.indent('{}\n'.format(json.dumps(unauthenticated_permissions['permissions'], indent=4)), '            '))
@@ -222,16 +233,15 @@ class Worker(multiprocessing.Process):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='This script will generate a list of permutations from ./permutations.txt using the keyword passed into the -k/--keyword argument. Then it will attempt to enumerate Google Storage buckets with those names without any authentication. If a bucket is found to be listable, it will be reported (buckets that allow access to "allUsers"). If a bucket is found but it is not listable, it will use the default "gcloud" CLI credentials to try and list the bucket. If the bucket is listable with credentials it will be reported (buckets that allow access to "allAuthenticatedUsers"), otherwise it will reported as existing, but unlistable.')
-    # Add mutually exclusive arguments: keyword or a single bucket
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--check', required=False, action="append", help='Check a single bucket name instead of bruteforcing names based on a keyword. May be repeated to check multiple buckets.')
     group.add_argument('--check-list', required=False, default=None, help='Check a list of buckets in the given file, one per line.')
-    group.add_argument('-k', '--keyword', required=False, help='The base keyword to use when guessing bucket names. This could be a simple string like "Google" or a URL like "google.com" or anything else. This string is used to generate permutations to search for.')
+    group.add_argument('-k', '--keyword', required=False, help='The base keyword to use when guessing bucket names.')
     group.add_argument('-w', '--wordlist', required=False, default=None, help='The path to a wordlist file')
-    parser.add_argument('-s', '--subprocesses', required=False, default=5, type=int, help='The amount of subprocesses to delegate work to for enumeration. Default: 5. This is essentially how many threads you want to run the script with, but it is using subprocesses instead of threads.')
-    parser.add_argument('-f', '--service-account-credential-file-path', required=False, default=None, help='The path to the JSON file that contains the private key for a GCP service account. By default, you will be prompted for a user access token, then if you decline to enter one it will prompt you to default to the default system credentials. More information here: https://google-auth.readthedocs.io/en/latest/user-guide.html#service-account-private-key-files and here: https://google-auth.readthedocs.io/en/latest/user-guide.html#user-credentials')
-    parser.add_argument('-u', '--unauthenticated', required=False, default=False, action='store_true', help='Force an unauthenticated scan (you will not be prompted for credentials)')
-    parser.add_argument('-o', '--out-file', required=False, default=None, help='The path to a log file to write the scan results to. The file will be created if it does not exist and will append to it if it already exists. By default output will only print to the screen.')
+    parser.add_argument('-s', '--subprocesses', required=False, default=5, type=int, help='The amount of subprocesses to delegate work to for enumeration. Default: 5.')
+    parser.add_argument('-f', '--service-account-credential-file-path', required=False, default=None, help='The path to the JSON file that contains the private key for a GCP service account.')
+    parser.add_argument('-u', '--unauthenticated', required=False, default=False, action='store_true', help='Force an unauthenticated scan')
+    parser.add_argument('-o', '--out-file', required=False, default=None, help='The path to a log file to write the scan results to.')
     args = parser.parse_args()
 
     main(args)
